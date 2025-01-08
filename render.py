@@ -45,9 +45,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
+        formats = [".jpg", ".jpeg", ".JPG", ".JPEG"]
         # Convert jpg to png
-        if view.image_name.endswith(".jpg"):
-            image_name = view.image_name.replace(".jpg", ".png")
+        for format in formats:
+            if view.image_name.endswith(format):
+                image_name = view.image_name.replace(format, "png")
         else:
             image_name = view.image_name
 
