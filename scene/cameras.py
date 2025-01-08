@@ -31,6 +31,7 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.is_test = is_test_dataset
 
         try:
             self.data_device = torch.device(data_device)

@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from tqdm import tqdm
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -142,7 +143,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, sample_interval=1):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -183,6 +184,9 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             print("------------LLFF HOLD-------------")
             cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
             cam_names = sorted(cam_names)
+            print("Total number of cameras: ", len(cam_names))
+            cam_names = cam_names[::sample_interval]
+            print("Total number of cameras after sampling: ", len(cam_names))
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
         else:
             with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
@@ -196,9 +200,15 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    print("Total number of cameras: ", len(cam_infos))
+    cam_infos = cam_infos[::sample_interval]
+    print("Total number of cameras after sampling: ", len(cam_infos))
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
+
+    print("Length of train_cam_infos: ", len(train_cam_infos))
+    print("Length of test_cam_infos: ", len(test_cam_infos))
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -309,7 +319,112 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            is_nerf_synthetic=True)
     return scene_info
 
+def readCamerasFromTransforms2(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
+    cam_infos = []
+
+    with open(os.path.join(path, transformsfile)) as json_file:
+        contents = json.load(json_file)
+        # fovx = contents["camera_angle_x"]
+        fl_x = contents["fl_x"]
+        fl_y = contents["fl_y"]
+        fovx = focal2fov(fl_x, contents["w"])
+        print(fovx)
+        cx = contents["cx"]
+        cy = contents["cy"]
+        w=contents["w"]
+        h=contents["h"]
+
+        frames = contents["frames"]
+        for idx, frame in tqdm(enumerate(frames)):
+            cam_name = os.path.join(path, "images/" + frame["file_path"] + extension)
+
+            # NeRF 'transform_matrix' is a camera-to-world transform
+            c2w = np.array(frame["transform_matrix"])
+            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+            c2w[2, :] *= -1
+            c2w = c2w[np.array([1, 0, 2, 3]), :]
+            c2w[0:3, 1:3] *= -1
+
+            # get the world-to-camera transform and set R, T
+            w2c = np.linalg.inv(c2w)
+            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+            T = w2c[:3, 3]
+
+            image_path = os.path.join(path, cam_name)
+            image_name = Path(cam_name).stem
+            image = Image.open(image_path)
+
+            im_data = np.array(image.convert("RGBA"))
+
+            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+            norm_data = im_data / 255.0
+            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            FovY = fovy 
+            FovX = fovx
+
+            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
+
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
+                            image_path=image_path, image_name=image_name,
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+            
+    return cam_infos
+
+def readNerfStudioInfo(path, white_background, depths, eval, extension="", llff_hold=8, sample_interval=1):
+    depths_folder=os.path.join(path, depths) if depths != "" else ""
+    print("Reading Transforms")
+    cam_infos = readCamerasFromTransforms2(path, "transforms.json", depths_folder, white_background, False, extension)
+    
+    cam_infos = sorted(cam_infos, key = lambda x : x.image_name)
+    cam_infos = cam_infos[::sample_interval]
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llff_hold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llff_hold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    txt_path = os.path.join(path, "colmap/points3D.txt")
+    if os.path.exists(txt_path) and not os.path.exists(ply_path):
+        print(f"Converting point3d.txt to .ply, will happen only the first time you open the scene.")
+        xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           is_nerf_synthetic=True)
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "NerfStudio": readNerfStudioInfo
 }
